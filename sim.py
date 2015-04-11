@@ -50,7 +50,7 @@ class Node(object):
 
     @classmethod
     def delay(cls, other, num_peers, msg_size):
-        bw = min(cls.ul_capacity / num_peers, other.dl_capacity)  # approximation
+        bw = min(cls.ul_capacity / float(num_peers), other.dl_capacity)  # approximation
         return 8 * msg_size / float(bw) + cls.base_latency
 
     def broadcast(self, msg):
@@ -207,7 +207,7 @@ if __name__ == '__main__':
 
     stats = ('avg_propagation_time', 'median_propagation_time', 'longest_propagation_time',
              'avg_quickest_path', 'avg_shortest_path', 'longest_quickest_path', 'pct_received')
-    msg_sizes = [1024 * x for x in [1, 2, 4, 8, 16]]
+    msg_sizes = [1024 * x for x in [1, 2, 4, 8, 16, 32, 64, 128]]
     peer_nums = (3, 5, 7, 9, 11)
 
     # msg_sizes = [1024 * x for x in [1, 2]]
@@ -235,7 +235,7 @@ if __name__ == '__main__':
         print
         print key
         # write header
-        print 'msg_size/num_peers\t' + '\t'.join('%d' % p for p in peer_nums)
+        print 'msg_size / num_peers\t' + '\t'.join('%d' % p for p in peer_nums)
         for i, msg_size in enumerate(msg_sizes):
             print '%s\t' % msg_size,
             for j, num_peers in enumerate(peer_nums):
