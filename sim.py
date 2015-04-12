@@ -3,46 +3,114 @@ Floodfill simulation of a single message
 """
 import random
 import statistics
-from simpy import Environment
+from simpy import Environment, Interrupt
+import sys
 random.seed(42)
 env = Environment()
 forwards = [0]
 
 
-class Message(object):
+class Transfer(object):
 
-    def __init__(self, sender, receiver, num_bytes, hops=0, sent_at=0, delay=0):
-        self.sender = sender
-        self.receiver = receiver
-        self.hops = hops
-        self.size = num_bytes
-        self.sent_at = sent_at
-        self.received_at = sent_at + delay
-        self.delay = delay
+    wan_latency = 0.01
+    wait = None
 
-    def forward(self, sender, receiver, delay):
-        forwards[0] += 1
-        return Message(sender, receiver, self.size, self.hops + 1,
-                       sent_at=self.received_at, delay=delay)
-
-    def deliver(self):
-        yield env.timeout(self.delay)
-        self.receiver.receive(self)
+    def __init__(self, msg, dl_cnx, ul_cnx, cb):
+        self.msg = msg
+        self.dl_cnx = dl_cnx
+        self.ul_cnx = ul_cnx
+        self.cb = cb
+        env.process(self.run())
 
     def __repr__(self):
-        return 'Msg(from=%r to=%r received_at=%.2f)' % (self.sender, self.receiver,
-                                                        self.received_at)
+        return '%s %r' % (self.name, self.wait)
+
+    def run(self):
+        self.wait = env.process(self.deliver())
+        yield self.wait
+
+    def deliver(self, nbits=None, elapsed=0):
+        self.dl_cnx.add_transfer(self)
+        self.ul_cnx.add_transfer(self)
+
+        nbits = nbits or self.msg.bit_size
+        assert nbits > 0, 'n>0'
+        duration = max(self.wan_latency - elapsed, 0)
+        bw = min(self.dl_cnx.bandwidth, self.ul_cnx.bandwidth)
+        duration += nbits / float(bw)
+        # print duration, bw, nbits
+        st = env.now
+        try:
+            yield env.timeout(duration)
+        except Interrupt:
+            elapsed = env.now - st
+            if elapsed < duration:
+                rbits = nbits - max(elapsed - self.wan_latency, 0) * bw
+                self.wait = env.process(self.deliver(rbits, elapsed))
+                return
+        # done
+        self.dl_cnx.remove_transfer(self)
+        self.ul_cnx.remove_transfer(self)
+        self.cb(self.msg)
+
+    def update_bandwidth(self):
+        self.wait.interrupt(cause='bw update')
+
+
+class Channel(object):
+
+    def __init__(self, capacity=100):
+        self.capacity = capacity
+        self.transfers = set()
+
+    @property
+    def bandwidth(self):
+        return self.capacity / max(1, len(self.transfers))
+
+    def add_transfer(self, t):
+        if t in self.transfers:
+            return
+        self.transfers.add(t)
+        for tt in self.transfers:
+            if t is not tt:
+                tt.update_bandwidth()
+
+    def remove_transfer(self, t):
+        if t not in self.transfers:
+            return
+        self.transfers.remove(t)
+        for t in self.transfers:
+            t.update_bandwidth()
+
+
+class Message(object):
+
+    received_at = 0  # timestamp on receive
+
+    def __init__(self, sender, num_bytes, hops=0):
+        self.sender = sender
+        self.hops = hops
+        self.byte_size = num_bytes
+        self.bit_size = num_bytes * 8
+
+    def forward(self, sender):
+        forwards[0] += 1
+        return Message(sender, self.byte_size, self.hops + 1)
+
+    def __repr__(self):
+        return 'Msg(hops=%s received_at=%.2f)' % (self.hops, self.received_at)
 
 
 class Node(object):
     ul_capacity = 0
     dl_capacity = 0
-    base_latency = 0.05
-    num_peers = 5
+    num_ul_peers = 0
 
     def __init__(self, name):
         self.name = name
         self.peers = []
+        self.in_channel = Channel(self.dl_capacity)
+        self.out_channel = Channel(self.ul_capacity)
 
     def reset(self):
         self.msg = None
@@ -51,20 +119,67 @@ class Node(object):
     def __repr__(self):
         return '%s(%s)' % (self.__class__.__name__, self.name)
 
-    @classmethod
-    def delay(cls, other, num_peers, msg_size):
-        bw = min(cls.ul_capacity / float(num_peers), other.dl_capacity)  # approximation
-        return 8 * msg_size / float(bw) + cls.base_latency
-
-    def broadcast(self, msg):
-        assert len(self.peers) >= self.num_peers
+    def p_broadcast(self, msg):
+        "parallel uploads"
+        assert len(self.peers) >= self.num_ul_peers
         peers = [p for p in self.peers if p is not msg.sender]
-        for p in peers[:self.num_peers]:  # forward to num_peers
-            p_msg = msg.forward(self, p, self.delay(p, len(self.peers), msg.size))
-            env.process(p_msg.deliver())
+        for p in peers[:self.num_ul_peers]:  # forward to num_ul_peers
+            p_msg = msg.forward(self)
+            Transfer(p_msg, self.out_channel, p.in_channel, p.receive)
+
+    def s_broadcast(self, msg, fastest_first=False):
+        "non parallel uploads"
+        assert len(self.peers) >= self.num_ul_peers
+        peers = [p for p in self.peers if p is not msg.sender][:self.num_ul_peers]
+
+        if fastest_first:
+            peers.sort(lambda a, b: cmp(b.out_channel.capacity, a.out_channel.capacity))
+            assert peers[0].out_channel.capacity >= peers[-1].out_channel.capacity
+
+        def next_up():
+            p = peers.pop(0)
+            p_msg = msg.forward(self)
+            Transfer(p_msg, self.out_channel, p.in_channel, mkcb(p))
+
+        def mkcb(receiver):
+            def cb(msg):
+                receiver.receive(msg)
+                if peers:
+                    next_up()
+            return cb
+
+        next_up()
+
+    def s_sorted_broadcast(self, msg):
+        return self.s_broadcast(msg, fastest_first=True)
+
+    def timeout_broadcast(self, msg, assumed_min_network_capacity=103537.):
+        """
+        broadcast to peers (fastest first) until a certain time passed
+        """
+        peers = sorted(self.peers, lambda a, b: cmp(b.out_channel.capacity, a.out_channel.capacity))
+        st = env.now
+        broadcast_duration = msg.bit_size / float(assumed_min_network_capacity)
+
+        def next_up():
+            p = peers.pop(0)
+            p_msg = msg.forward(self)
+            Transfer(p_msg, self.out_channel, p.in_channel, mkcb(p))
+
+        def mkcb(receiver):
+            def cb(msg):
+                receiver.receive(msg)
+                if peers:
+                    if env.now - st < broadcast_duration:
+                        next_up()
+            return cb
+
+        next_up()
+
+    broadcast = s_sorted_broadcast
 
     def receive(self, msg):
-        # print self, 'received', env.now, msg
+        msg.received_at = env.now
         if not self.shortest_path or msg.hops < self.shortest_path:
             self.shortest_path = msg.hops
         if not self.msg:
@@ -81,28 +196,24 @@ class Network(object):
         self.node_classes = []
         self.nodes = []
 
-    def add_node_class(self, label, fraction, ul_capacity=Node.ul_capacity,
-                       dl_capacity=Node.dl_capacity, num_peers=Node.num_peers,
-                       base_latency=Node.base_latency
-                       ):
+    def add_node_class(self, label, fraction, ul_capacity=0, dl_capacity=0, num_ul_peers=0):
 
-        def create(ul, dl, np, bl, name):
+        def create(ul, dl, np, name):
 
             class N(Node):
                 ul_capacity = ul  # bits/s
                 dl_capacity = dl  # bits/s
-                base_latency = bl  # secs
-                num_peers = np
+                num_ul_peers = np
             N.__name__ = 'Node' + name
             return N
 
-        klass = create(ul_capacity, dl_capacity, num_peers, base_latency, label)
+        klass = create(ul_capacity, dl_capacity, num_ul_peers, label)
         self.node_classes.append((klass, fraction))
 
-    def set_num_peers(self, num):
+    def set_num_ul_peers(self, num):
         assert self.nodes
         for n in self.nodes:
-            n.num_peers = num
+            n.num_ul_peers = num
 
     def nodes_by_class(self, cls):
         if issubclass(cls, Node):
@@ -111,15 +222,15 @@ class Network(object):
             assert isinstance(cls, str)
             return [n for n in self.nodes if n.__class__.__name__ == 'Node' + cls]
 
-    def create(self, num_peers):
+    def create(self, max_peers):
         "setup random network"
         norm = sum(x[1] for x in self.node_classes)
         node_classes = [(k, v / float(norm)) for k, v in self.node_classes]
         assert sum(x[1] for x in node_classes) == 1.
 
+        # setup nodes
         nodes = []
         for klass, probability in node_classes:
-            #klass.num_peers = num_peers
             for i in xrange(int(self.num_nodes * probability)):
                 nodes.append(klass(i))
         for j in range(self.num_nodes - len(nodes)):  # fill up rounding error
@@ -127,25 +238,26 @@ class Network(object):
         assert len(nodes) == num_nodes
         self.nodes = nodes
 
-        # set num peers
-        self.set_num_peers(num_peers)
-
         # create random connections
-        for n in nodes:
-            while len(n.peers) < n.num_peers:
-                p = random.choice(nodes)
-                if p is not n:
-                    n.peers.append(p)
+        not_paired = 0
+        for i in range(max_peers):
+            for a, b in zip(nodes, random.sample(nodes, len(nodes))):
+                if a == b:
+                    not_paired += 1
+                else:
+                    a.peers.append(b)
+                    b.peers.append(a)
 
         self.initiator = random.choice(self.nodes)
+        print 'initiating node', self.initiator
 
-    def sim_broadcast(self, msg_size=256):
+    def sim_broadcast(self, num_bytes=0):
         assert self.nodes
         for n in self.nodes:
             n.reset()
         # process events
         env._now = 0
-        self.initiator.broadcast(Message(self.initiator, self.initiator, num_bytes=msg_size))
+        self.initiator.broadcast(Message(self.initiator, num_bytes=num_bytes))
         env.run()
 
     def stats(self, nodes=None):
@@ -182,9 +294,9 @@ class Network(object):
         stats['longest_propagation_time'] = max(times)
 
         # capacity bps
-        msg_size = receivers[0].msg.size
-        stats['avg_capacity'] = int(8. * msg_size / statistics.mean(times))
-        stats['min_capacity'] = int(8. * msg_size / max(times))
+        msg_bit_size = receivers[0].msg.bit_size
+        stats['avg_capacity'] = int(msg_bit_size / statistics.mean(times))
+        stats['min_capacity'] = int(msg_bit_size / max(times))
 
         return stats
 
@@ -208,39 +320,42 @@ node_types = [
     dict(label='2mbps', fraction=.08, ul_capacity=256 * kbps, dl_capacity=2 * mbps),
 ]
 
-for nt in node_types:
-    print nt
+# for nt in node_types:
+#     print repr(nt)[1:-1]
 
 
-def do_sim(num_nodes, msg_size, num_peers):
+def do_sim(num_nodes, num_bytes, num_ul_peers):
     # create network
     network = Network(num_nodes)
     for nt in node_types:
         network.add_node_class(**nt)
-    network.create(num_peers)
+    network.create(num_ul_peers + 2)
+    network.set_num_ul_peers(num_ul_peers)
     # run sim
-    network.sim_broadcast(msg_size=msg_size)
+    network.sim_broadcast(num_bytes=num_bytes)
     return network.stats()
 
 
 if __name__ == '__main__':
     num_nodes = 10000
-    num_samples = 10
-    msg_sizes = [1024 * x for x in [1, 2, 4, 8, 16, 32, 64, 128]]
-    peer_nums = (3, 5, 7, 9, 11, 13, 15, 20)
+    num_samples = 2
+    msg_byte_sizes = [1024 * x for x in [1, 4, 16, 64, 256, 1024]]  # bytes
+    ul_peer_count = (5, 10, 15, 20)
 
     if False:
         num_nodes = 1000
         num_samples = 2
-        msg_sizes = [1024 * x for x in [1, 4, 16,  128, 512]]
-        peer_nums = (5, 7, 11, 15, 25)
+        msg_byte_sizes = [1024 * x for x in [1, 4, 16,  128, 512]]
+        ul_peer_count = (5, 7, 11, 15, 25)
     if True:
         num_nodes = 10000
-        num_samples = 5
-        msg_sizes = [1024 * x for x in [1, 16]]
-        peer_nums = (7, 11)
+        num_samples = 2
+        msg_byte_sizes = [1024 * x for x in [64]]
+        ul_peer_count = (10, )
 
-    nsims = num_samples * len(msg_sizes) * len(peer_nums)
+    max_peers = 200
+
+    nsims = num_samples * len(msg_byte_sizes) * len(ul_peer_count)
     print 'running %d sims' % nsims
     # setup networks
     networks = []
@@ -248,7 +363,7 @@ if __name__ == '__main__':
         n = Network(num_nodes)
         for nt in node_types:
             n.add_node_class(**nt)
-            n.create(num_peers=max(peer_nums) + 1)
+        n.create(max_peers=max_peers)
         networks.append(n)
     print 'created %d networks' % len(networks)
 
@@ -257,18 +372,18 @@ if __name__ == '__main__':
              'longest_quickest_path_len', 'pct_received']
 
     table = []
-    for msg_size in msg_sizes:
+    for msg_bytes in msg_byte_sizes:
         row = []
         table.append(row)
-        for num_peers in peer_nums:
-            print 'simulating', msg_size, num_peers
+        for num_ul_peers in ul_peer_count:
+            print 'simulating', msg_bytes, num_ul_peers
             pstats = []
             for i in range(num_samples):  # do N sims for each set of params
                 network = networks[i]
-                network.set_num_peers(num_peers)
-                assert network.nodes[0].num_peers == num_peers
-                assert (network.nodes[0].peers) >= num_peers
-                network.sim_broadcast(msg_size=msg_size)  # resets env and nodes
+                network.set_num_ul_peers(num_ul_peers)
+                assert network.nodes[0].num_ul_peers == num_ul_peers
+                assert (network.nodes[0].peers) >= num_ul_peers
+                network.sim_broadcast(num_bytes=msg_bytes)  # resets env and nodes
                 pstats.append(network.stats())
             cell = dict()
             rdevs = []
@@ -289,12 +404,18 @@ if __name__ == '__main__':
         print
         print key
         # write header
-        print 'msg_size / num_peers\t' + '\t'.join('%d' % p for p in peer_nums)
-        for i, msg_size in enumerate(msg_sizes):
+        print 'msg_size(bytes) / num_ul_peers\t' + '\t'.join('%d' % p for p in ul_peer_count)
+        for i, msg_size in enumerate(msg_byte_sizes):
             print '%s\t' % msg_size,
-            for j, num_peers in enumerate(peer_nums):
+            for j, num_ul_peers in enumerate(ul_peer_count):
                 v = table[i][j][key]
                 if isinstance(v, float):
                     v = '%.2f' % v
                 print '%s\t' % v,
             print
+
+    print 'forwards', forwards
+
+"""
+test bw adjusted num_nodes
+"""
