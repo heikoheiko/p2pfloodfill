@@ -338,22 +338,22 @@ def do_sim(num_nodes, num_bytes, num_ul_peers):
 
 if __name__ == '__main__':
     num_nodes = 10000
-    num_samples = 2
+    num_samples = 5
     msg_byte_sizes = [1024 * x for x in [1, 4, 16, 64, 256, 1024]]  # bytes
-    ul_peer_count = (5, 10, 15, 20)
+    ul_peer_count = (5, 7, 9, 11, 13, 15)
 
     if False:
         num_nodes = 1000
         num_samples = 2
         msg_byte_sizes = [1024 * x for x in [1, 4, 16,  128, 512]]
         ul_peer_count = (5, 7, 11, 15, 25)
-    if True:
+    if False:
         num_nodes = 10000
         num_samples = 2
         msg_byte_sizes = [1024 * x for x in [64]]
         ul_peer_count = (10, )
 
-    max_peers = 200
+    max_peers = max(ul_peer_count)
 
     nsims = num_samples * len(msg_byte_sizes) * len(ul_peer_count)
     print 'running %d sims' % nsims
